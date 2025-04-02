@@ -244,3 +244,56 @@
     (ok true)
   )
 )
+
+;; Withdraw collateral if health factor permits
+(define-public (withdraw-collateral (sbtc-token <sip-010-trait>) (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    (match (map-get? vaults { owner: tx-sender })
+      vault
+        (let
+          (
+            (current-collateral (get collateral-amount vault))
+            (current-debt (get debt-amount vault))
+          )
+          ;; Check if withdrawal would leave sufficient collateral
+          (asserts! (<= amount current-collateral) ERR_INSUFFICIENT_COLLATERAL)
+          
+          ;; If there's debt, check if health factor will remain above minimum after withdrawal
+          (if (> current-debt u0)
+            (let
+              (
+                (remaining-collateral (- current-collateral amount))
+                (collateral-value (calculate-collateral-value remaining-collateral))
+                (min-collateral-ratio (get liquidation-ratio vault))
+                (required-collateral (/ (* current-debt min-collateral-ratio) u10000))
+              )
+              (asserts! (>= collateral-value required-collateral) ERR_VAULT_NOT_HEALTHY)
+            )
+            true
+          )
+          
+          ;; Update vault
+          (try! (as-contract (contract-call? sbtc-token transfer amount (as-contract tx-sender) tx-sender none)))
+          
+          (map-set vaults
+            { owner: tx-sender }
+            {
+              collateral-amount: (- current-collateral amount),
+              debt-amount: current-debt,
+              last-interest-block: block-height,
+              liquidation-ratio: (get liquidation-ratio vault)
+            }
+          )
+          
+          ;; Update total collateral
+          (var-set total-collateral (- (var-get total-collateral) amount))
+          
+          (ok true)
+        )
+      (err ERR_VAULT_NOT_FOUND)
+    )
+  )
+)
