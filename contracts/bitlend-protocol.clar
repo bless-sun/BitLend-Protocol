@@ -178,3 +178,69 @@
     (err ERR_VAULT_NOT_FOUND)
   )
 )
+
+;; Public functions
+
+;; Initialize protocol parameters
+(define-public (initialize-protocol)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get governance-enabled)) ERR_ALREADY_INITIALIZED)
+    
+    ;; Set initial protocol parameters
+    (map-set protocol-parameters { parameter-name: "minimum-collateral-ratio" } { value: u15000 }) ;; 150%
+    (map-set protocol-parameters { parameter-name: "liquidation-penalty" } { value: u1000 })      ;; 10%
+    (map-set protocol-parameters { parameter-name: "base-rate" } { value: u200 })                 ;; 2%
+    (map-set protocol-parameters { parameter-name: "utilization-multiplier" } { value: u800 })    ;; 8%
+    (map-set protocol-parameters { parameter-name: "governance-token-threshold" } { value: u100000000 }) ;; 100 tokens (assuming 6 decimals)
+    (map-set protocol-parameters { parameter-name: "proposal-duration" } { value: u144 })         ;; ~1 day at 10 min blocks
+    (map-set protocol-parameters { parameter-name: "blocks-per-year" } { value: u52560 })         ;; 365 * 144 blocks
+
+    ;; Mint initial governance tokens to contract owner
+    (ft-mint? GOVERNANCE_TOKEN u1000000000 CONTRACT_OWNER)
+    
+    ;; Enable governance
+    (var-set governance-enabled true)
+    (ok true)
+  )
+)
+
+;; Create a vault or deposit more collateral
+(define-public (deposit-collateral (sbtc-token <sip-010-trait>) (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    ;; Transfer sBTC from user to contract
+    (try! (contract-call? sbtc-token transfer amount tx-sender (as-contract tx-sender) none))
+    
+    ;; Update or create vault
+    (match (map-get? vaults { owner: tx-sender })
+      existing-vault
+        (map-set vaults
+          { owner: tx-sender }
+          {
+            collateral-amount: (+ (get collateral-amount existing-vault) amount),
+            debt-amount: (get debt-amount existing-vault),
+            last-interest-block: block-height,
+            liquidation-ratio: (get liquidation-ratio existing-vault)
+          }
+        )
+      ;; Create new vault if it doesn't exist
+      (map-set vaults
+        { owner: tx-sender }
+        {
+          collateral-amount: amount,
+          debt-amount: u0,
+          last-interest-block: block-height,
+          liquidation-ratio: (get-parameter "minimum-collateral-ratio")
+        }
+      )
+    )
+    
+    ;; Update total collateral
+    (var-set total-collateral (+ (var-get total-collateral) amount))
+    
+    (ok true)
+  )
+)
