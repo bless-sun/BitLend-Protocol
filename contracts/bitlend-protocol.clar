@@ -116,3 +116,65 @@
     (err ERR_VAULT_NOT_FOUND)
   )
 )
+
+;; Calculate USD value of collateral
+(define-read-only (calculate-collateral-value (amount uint))
+  (let
+    (
+      (btc-price (unwrap-panic (contract-call? .price-oracle get-price)))
+      (decimals (unwrap-panic (contract-call? .price-oracle get-decimals)))
+    )
+    (* amount (/ btc-price (pow u10 decimals)))
+  )
+)
+
+;; Get protocol parameter
+(define-read-only (get-parameter (parameter-name (string-ascii 32)))
+  (default-to u0 (get value (map-get? protocol-parameters { parameter-name: parameter-name })))
+)
+
+;; Get proposal details
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? governance-proposals { proposal-id: proposal-id })
+)
+
+;; Get current interest rate based on utilization
+(define-read-only (get-current-interest-rate)
+  (let
+    (
+      (base-rate (get-parameter "base-rate"))
+      (utilization-multiplier (get-parameter "utilization-multiplier"))
+      (utilization-rate (calculate-utilization-rate))
+    )
+    (+ base-rate (* utilization-rate utilization-multiplier))
+  )
+)
+
+;; Calculate protocol utilization rate (debt / collateral)
+(define-read-only (calculate-utilization-rate)
+  (if (is-eq (var-get total-collateral) u0)
+    u0
+    (/ (* (var-get total-debt) u10000) (var-get total-collateral))
+  )
+)
+
+;; Calculate accrued interest for a vault
+(define-read-only (calculate-accrued-interest (owner principal))
+  (match (map-get? vaults { owner: owner })
+    vault
+      (let
+        (
+          (debt (get debt-amount vault))
+          (last-block (get last-interest-block vault))
+          (current-block block-height)
+          (blocks-passed (- current-block last-block))
+          (interest-rate (get-current-interest-rate))
+          ;; Interest formula: debt * (rate / 10000) * (blocks / blocks-per-year)
+          (blocks-per-year (get-parameter "blocks-per-year"))
+          (interest-amount (/ (* debt (* interest-rate blocks-passed)) (* blocks-per-year u10000)))
+        )
+        (ok interest-amount)
+      )
+    (err ERR_VAULT_NOT_FOUND)
+  )
+)
