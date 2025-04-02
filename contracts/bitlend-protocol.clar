@@ -421,3 +421,48 @@
     )
   )
 )
+
+;; Governance functions
+
+;; Create governance proposal
+(define-public (create-proposal 
+  (title (string-ascii 64)) 
+  (description (string-utf8 256)) 
+  (parameter-name (string-ascii 32)) 
+  (proposed-value uint))
+  (begin
+    (asserts! (var-get governance-enabled) ERR_GOVERNANCE_DISABLED)
+    
+    ;; Check if proposer has enough governance tokens
+    (let 
+      (
+        (threshold (get-parameter "governance-token-threshold"))
+        (user-balance (unwrap! (ft-get-balance GOVERNANCE_TOKEN tx-sender) ERR_INSUFFICIENT_BALANCE))
+        (proposal-id (var-get next-proposal-id))
+        (proposal-duration (get-parameter "proposal-duration"))
+      )
+      (asserts! (>= user-balance threshold) ERR_UNAUTHORIZED)
+      
+      ;; Create proposal
+      (map-set governance-proposals
+        { proposal-id: proposal-id }
+        {
+          proposer: tx-sender,
+          title: title,
+          description: description,
+          parameter-name: parameter-name,
+          proposed-value: proposed-value,
+          votes-for: u0,
+          votes-against: u0,
+          status: "active",
+          end-block: (+ block-height proposal-duration)
+        }
+      )
+      
+      ;; Increment proposal counter
+      (var-set next-proposal-id (+ proposal-id u1))
+      
+      (ok proposal-id)
+    )
+  )
+)
