@@ -341,3 +341,83 @@
     )
   )
 )
+
+;; Repay debt
+(define-public (repay (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    (match (map-get? vaults { owner: tx-sender })
+      vault
+        (let
+          (
+            (current-debt (get debt-amount vault))
+            (accrued-interest (unwrap-panic (calculate-accrued-interest tx-sender)))
+            (total-owed (+ current-debt accrued-interest))
+            (repay-amount (if (> amount total-owed) total-owed amount))
+          )
+          ;; Check if user has sufficient stablecoins
+          (try! (ft-burn? USDA repay-amount tx-sender))
+          
+          ;; Update vault
+          (map-set vaults
+            { owner: tx-sender }
+            {
+              collateral-amount: (get collateral-amount vault),
+              debt-amount: (- total-owed repay-amount),
+              last-interest-block: block-height,
+              liquidation-ratio: (get liquidation-ratio vault)
+            }
+          )
+          
+          ;; Update total debt
+          (var-set total-debt (- (var-get total-debt) repay-amount))
+          
+          (ok true)
+        )
+      (err ERR_VAULT_NOT_FOUND)
+    )
+  )
+)
+
+;; Liquidation function - can be called by anyone when a vault is undercollateralized
+(define-public (liquidate (vault-owner principal) (sbtc-token <sip-010-trait>))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    
+    (match (map-get? vaults { owner: vault-owner })
+      vault
+        (let
+          (
+            (current-collateral (get collateral-amount vault))
+            (current-debt (get debt-amount vault))
+            (collateral-value (calculate-collateral-value current-collateral))
+            (min-collateral-ratio (get liquidation-ratio vault))
+            (required-value (/ (* current-debt min-collateral-ratio) u10000))
+            (liquidation-penalty (get-parameter "liquidation-penalty"))
+            (penalty-amount (/ (* current-debt liquidation-penalty) u10000))
+            (total-to-repay (+ current-debt penalty-amount))
+          )
+          ;; Check if vault is undercollateralized
+          (asserts! (< collateral-value required-value) ERR_VAULT_NOT_HEALTHY)
+          
+          ;; Check if liquidator has enough stablecoins
+          (try! (ft-burn? USDA total-to-repay tx-sender))
+          
+          ;; Transfer collateral to liquidator
+          (try! (as-contract (contract-call? sbtc-token transfer current-collateral (as-contract tx-sender) tx-sender none)))
+          
+          ;; Close the vault
+          (map-delete vaults { owner: vault-owner })
+          
+          ;; Update totals
+          (var-set total-collateral (- (var-get total-collateral) current-collateral))
+          (var-set total-debt (- (var-get total-debt) current-debt))
+          
+          (ok true)
+        )
+      (err ERR_VAULT_NOT_FOUND)
+    )
+  )
+)
