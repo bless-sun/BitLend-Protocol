@@ -297,3 +297,47 @@
     )
   )
 )
+
+;; Borrow stablecoins against collateral
+(define-public (borrow (amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    (match (map-get? vaults { owner: tx-sender })
+      vault
+        (let
+          (
+            (current-collateral (get collateral-amount vault))
+            (current-debt (get debt-amount vault))
+            (new-debt (+ current-debt amount))
+            (collateral-value (calculate-collateral-value current-collateral))
+            (min-collateral-ratio (get liquidation-ratio vault))
+            (required-collateral (/ (* new-debt min-collateral-ratio) u10000))
+          )
+          ;; Check if borrowing would leave sufficient collateralization
+          (asserts! (>= collateral-value required-collateral) ERR_INSUFFICIENT_COLLATERAL)
+          
+          ;; Mint stablecoins to borrower
+          (try! (ft-mint? USDA amount tx-sender))
+          
+          ;; Update vault
+          (map-set vaults
+            { owner: tx-sender }
+            {
+              collateral-amount: current-collateral,
+              debt-amount: new-debt,
+              last-interest-block: block-height,
+              liquidation-ratio: (get liquidation-ratio vault)
+            }
+          )
+          
+          ;; Update total debt
+          (var-set total-debt (+ (var-get total-debt) amount))
+          
+          (ok true)
+        )
+      (err ERR_VAULT_NOT_FOUND)
+    )
+  )
+)
