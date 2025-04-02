@@ -24,6 +24,7 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u1009))
 (define-constant ERR_VAULT_NOT_HEALTHY (err u1010))
 (define-constant ERR_PROPOSAL_NOT_ACTIVE (err u1011))
+(define-constant ERR_ORACLE_NOT_SET (err u1012))
 
 ;; Governance token info
 (define-fungible-token GOVERNANCE_TOKEN)
@@ -64,11 +65,16 @@
   { vote-amount: uint, vote-direction: bool }  ;; true = for, false = against
 )
 
+;; Data vars
 (define-data-var next-proposal-id uint u1)
 (define-data-var total-collateral uint u0)
 (define-data-var total-debt uint u0)
 (define-data-var protocol-paused bool false)
 (define-data-var governance-enabled bool false)
+(define-data-var oracle-contract principal 'ST000000000000000000002AMW42H.oracle)
+;; Replace the complex oracle integration with a simple mock
+(define-data-var btc-price uint u30000)  ;; Mock BTC price in USD (e.g., $30,000)
+(define-data-var price-decimals uint u0) ;; No decimals for simplicity
 
 ;; SIP-010 compliant fungible token for the stablecoin
 (define-fungible-token USDA)
@@ -94,18 +100,22 @@
 ;; Get vault information for a user
 (define-read-only (get-vault (owner principal))
   (match (map-get? vaults { owner: owner })
-    vault vault
+    vault (ok vault)
     (err ERR_VAULT_NOT_FOUND)
   )
 )
 
+(define-read-only (get-btc-price)
+  (var-get btc-price)
+)
+
 ;; Calculate current health factor for a vault (collateralization ratio)
-(define-read-only (get-health-factor (owner principal))
+(define-private (get-health-factor (owner principal))
   (match (map-get? vaults { owner: owner })
     vault
       (let 
         (
-          (collateral-value (calculate-collateral-value (get collateral-amount vault)))
+          (collateral-value (unwrap-panic (calculate-collateral-value (get collateral-amount vault))))
           (debt-value (get debt-amount vault))
         )
         (if (is-eq debt-value u0)
@@ -117,15 +127,14 @@
   )
 )
 
+;; Get current oracle contract
+(define-read-only (get-oracle-contract)
+  (var-get oracle-contract)
+)
+
 ;; Calculate USD value of collateral
-(define-read-only (calculate-collateral-value (amount uint))
-  (let
-    (
-      (btc-price (unwrap-panic (contract-call? .price-oracle get-price)))
-      (decimals (unwrap-panic (contract-call? .price-oracle get-decimals)))
-    )
-    (* amount (/ btc-price (pow u10 decimals)))
-  )
+(define-private (calculate-collateral-value (amount uint))
+  (ok (* amount (var-get btc-price)))
 )
 
 ;; Get protocol parameter
@@ -166,7 +175,7 @@
         (
           (debt (get debt-amount vault))
           (last-block (get last-interest-block vault))
-          (current-block block-height)
+          (current-block stacks-block-height)
           (blocks-passed (- current-block last-block))
           (interest-rate (get-current-interest-rate))
           ;; Interest formula: debt * (rate / 10000) * (blocks / blocks-per-year)
@@ -197,7 +206,7 @@
     (map-set protocol-parameters { parameter-name: "blocks-per-year" } { value: u52560 })         ;; 365 * 144 blocks
 
     ;; Mint initial governance tokens to contract owner
-    (ft-mint? GOVERNANCE_TOKEN u1000000000 CONTRACT_OWNER)
+    (try! (ft-mint? GOVERNANCE_TOKEN u1000000000 CONTRACT_OWNER))
     
     ;; Enable governance
     (var-set governance-enabled true)
@@ -222,7 +231,7 @@
           {
             collateral-amount: (+ (get collateral-amount existing-vault) amount),
             debt-amount: (get debt-amount existing-vault),
-            last-interest-block: block-height,
+            last-interest-block: stacks-block-height,
             liquidation-ratio: (get liquidation-ratio existing-vault)
           }
         )
@@ -232,7 +241,7 @@
         {
           collateral-amount: amount,
           debt-amount: u0,
-          last-interest-block: block-height,
+          last-interest-block: stacks-block-height,
           liquidation-ratio: (get-parameter "minimum-collateral-ratio")
         }
       )
@@ -266,11 +275,14 @@
             (let
               (
                 (remaining-collateral (- current-collateral amount))
-                (collateral-value (calculate-collateral-value remaining-collateral))
+                (collateral-value-result (calculate-collateral-value remaining-collateral))
                 (min-collateral-ratio (get liquidation-ratio vault))
                 (required-collateral (/ (* current-debt min-collateral-ratio) u10000))
               )
-              (asserts! (>= collateral-value required-collateral) ERR_VAULT_NOT_HEALTHY)
+              (match collateral-value-result 
+                collateral-value (asserts! (>= collateral-value required-collateral) ERR_VAULT_NOT_HEALTHY)
+                err (err err)
+              )
             )
             true
           )
@@ -283,7 +295,7 @@
             {
               collateral-amount: (- current-collateral amount),
               debt-amount: current-debt,
-              last-interest-block: block-height,
+              last-interest-block: stacks-block-height,
               liquidation-ratio: (get liquidation-ratio vault)
             }
           )
@@ -311,31 +323,37 @@
             (current-collateral (get collateral-amount vault))
             (current-debt (get debt-amount vault))
             (new-debt (+ current-debt amount))
-            (collateral-value (calculate-collateral-value current-collateral))
+            (collateral-value-result (calculate-collateral-value current-collateral))
             (min-collateral-ratio (get liquidation-ratio vault))
             (required-collateral (/ (* new-debt min-collateral-ratio) u10000))
           )
           ;; Check if borrowing would leave sufficient collateralization
-          (asserts! (>= collateral-value required-collateral) ERR_INSUFFICIENT_COLLATERAL)
-          
-          ;; Mint stablecoins to borrower
-          (try! (ft-mint? USDA amount tx-sender))
-          
-          ;; Update vault
-          (map-set vaults
-            { owner: tx-sender }
-            {
-              collateral-amount: current-collateral,
-              debt-amount: new-debt,
-              last-interest-block: block-height,
-              liquidation-ratio: (get liquidation-ratio vault)
-            }
+          (match collateral-value-result
+            collateral-value 
+              (begin
+                (asserts! (>= collateral-value required-collateral) ERR_INSUFFICIENT_COLLATERAL)
+                
+                ;; Mint stablecoins to borrower
+                (try! (ft-mint? USDA amount tx-sender))
+                
+                ;; Update vault
+                (map-set vaults
+                  { owner: tx-sender }
+                  {
+                    collateral-amount: current-collateral,
+                    debt-amount: new-debt,
+                    last-interest-block: stacks-block-height,
+                    liquidation-ratio: (get liquidation-ratio vault)
+                  }
+                )
+                
+                ;; Update total debt
+                (var-set total-debt (+ (var-get total-debt) amount))
+                
+                (ok true)
+              )
+            err (err err)
           )
-          
-          ;; Update total debt
-          (var-set total-debt (+ (var-get total-debt) amount))
-          
-          (ok true)
         )
       (err ERR_VAULT_NOT_FOUND)
     )
@@ -353,28 +371,36 @@
         (let
           (
             (current-debt (get debt-amount vault))
-            (accrued-interest (unwrap-panic (calculate-accrued-interest tx-sender)))
-            (total-owed (+ current-debt accrued-interest))
-            (repay-amount (if (> amount total-owed) total-owed amount))
+            (accrued-interest-result (calculate-accrued-interest tx-sender))
           )
-          ;; Check if user has sufficient stablecoins
-          (try! (ft-burn? USDA repay-amount tx-sender))
-          
-          ;; Update vault
-          (map-set vaults
-            { owner: tx-sender }
-            {
-              collateral-amount: (get collateral-amount vault),
-              debt-amount: (- total-owed repay-amount),
-              last-interest-block: block-height,
-              liquidation-ratio: (get liquidation-ratio vault)
-            }
+          (match accrued-interest-result
+            accrued-interest
+              (let
+                (
+                  (total-owed (+ current-debt accrued-interest))
+                  (repay-amount (if (> amount total-owed) total-owed amount))
+                )
+                ;; Check if user has sufficient stablecoins
+                (try! (ft-burn? USDA repay-amount tx-sender))
+                
+                ;; Update vault
+                (map-set vaults
+                  { owner: tx-sender }
+                  {
+                    collateral-amount: (get collateral-amount vault),
+                    debt-amount: (- total-owed repay-amount),
+                    last-interest-block: stacks-block-height,
+                    liquidation-ratio: (get liquidation-ratio vault)
+                  }
+                )
+                
+                ;; Update total debt
+                (var-set total-debt (- (var-get total-debt) repay-amount))
+                
+                (ok true)
+              )
+            err (err err)
           )
-          
-          ;; Update total debt
-          (var-set total-debt (- (var-get total-debt) repay-amount))
-          
-          (ok true)
         )
       (err ERR_VAULT_NOT_FOUND)
     )
@@ -392,30 +418,36 @@
           (
             (current-collateral (get collateral-amount vault))
             (current-debt (get debt-amount vault))
-            (collateral-value (calculate-collateral-value current-collateral))
+            (collateral-value-result (calculate-collateral-value current-collateral))
             (min-collateral-ratio (get liquidation-ratio vault))
             (required-value (/ (* current-debt min-collateral-ratio) u10000))
             (liquidation-penalty (get-parameter "liquidation-penalty"))
             (penalty-amount (/ (* current-debt liquidation-penalty) u10000))
             (total-to-repay (+ current-debt penalty-amount))
           )
-          ;; Check if vault is undercollateralized
-          (asserts! (< collateral-value required-value) ERR_VAULT_NOT_HEALTHY)
-          
-          ;; Check if liquidator has enough stablecoins
-          (try! (ft-burn? USDA total-to-repay tx-sender))
-          
-          ;; Transfer collateral to liquidator
-          (try! (as-contract (contract-call? sbtc-token transfer current-collateral (as-contract tx-sender) tx-sender none)))
-          
-          ;; Close the vault
-          (map-delete vaults { owner: vault-owner })
-          
-          ;; Update totals
-          (var-set total-collateral (- (var-get total-collateral) current-collateral))
-          (var-set total-debt (- (var-get total-debt) current-debt))
-          
-          (ok true)
+          (match collateral-value-result
+            collateral-value
+              (begin
+                ;; Check if vault is undercollateralized
+                (asserts! (< collateral-value required-value) ERR_VAULT_NOT_HEALTHY)
+                
+                ;; Check if liquidator has enough stablecoins
+                (try! (ft-burn? USDA total-to-repay tx-sender))
+                
+                ;; Transfer collateral to liquidator
+                (try! (as-contract (contract-call? sbtc-token transfer current-collateral (as-contract tx-sender) tx-sender none)))
+                
+                ;; Close the vault
+                (map-delete vaults { owner: vault-owner })
+                
+                ;; Update totals
+                (var-set total-collateral (- (var-get total-collateral) current-collateral))
+                (var-set total-debt (- (var-get total-debt) current-debt))
+                
+                (ok true)
+              )
+            err (err err)  
+          )
         )
       (err ERR_VAULT_NOT_FOUND)
     )
@@ -437,32 +469,38 @@
     (let 
       (
         (threshold (get-parameter "governance-token-threshold"))
-        (user-balance (unwrap! (ft-get-balance GOVERNANCE_TOKEN tx-sender) ERR_INSUFFICIENT_BALANCE))
+        (user-balance-result (ft-get-balance GOVERNANCE_TOKEN tx-sender))
         (proposal-id (var-get next-proposal-id))
         (proposal-duration (get-parameter "proposal-duration"))
       )
-      (asserts! (>= user-balance threshold) ERR_UNAUTHORIZED)
-      
-      ;; Create proposal
-      (map-set governance-proposals
-        { proposal-id: proposal-id }
-        {
-          proposer: tx-sender,
-          title: title,
-          description: description,
-          parameter-name: parameter-name,
-          proposed-value: proposed-value,
-          votes-for: u0,
-          votes-against: u0,
-          status: "active",
-          end-block: (+ block-height proposal-duration)
-        }
+      (match user-balance-result
+        user-balance
+          (begin 
+            (asserts! (>= user-balance threshold) ERR_UNAUTHORIZED)
+            
+            ;; Create proposal
+            (map-set governance-proposals
+              { proposal-id: proposal-id }
+              {
+                proposer: tx-sender,
+                title: title,
+                description: description,
+                parameter-name: parameter-name,
+                proposed-value: proposed-value,
+                votes-for: u0,
+                votes-against: u0,
+                status: "active",
+                end-block: (+ stacks-block-height proposal-duration)
+              }
+            )
+            
+            ;; Increment proposal counter
+            (var-set next-proposal-id (+ proposal-id u1))
+            
+            (ok proposal-id)
+          )
+        err (err ERR_INSUFFICIENT_BALANCE)
       )
-      
-      ;; Increment proposal counter
-      (var-set next-proposal-id (+ proposal-id u1))
-      
-      (ok proposal-id)
     )
   )
 )
@@ -476,78 +514,86 @@
       proposal
         (let
           (
-            (user-balance (unwrap! (ft-get-balance GOVERNANCE_TOKEN tx-sender) ERR_INSUFFICIENT_BALANCE))
+            (user-balance-result (ft-get-balance GOVERNANCE_TOKEN tx-sender))
             (proposal-active (is-eq (get status proposal) "active"))
-            (not-ended (<= block-height (get end-block proposal)))
+            (not-ended (<= stacks-block-height (get end-block proposal)))
           )
           ;; Check if proposal is active and not ended
           (asserts! (and proposal-active not-ended) ERR_PROPOSAL_NOT_ACTIVE)
           
-          ;; Check if user has enough tokens
-          (asserts! (>= user-balance vote-amount) ERR_INSUFFICIENT_BALANCE)
-          
-          ;; Record vote
-          (match (map-get? user-votes { proposal-id: proposal-id, voter: tx-sender })
-            previous-vote
-              ;; Update existing vote
-              (let
-                (
-                  (previous-amount (get vote-amount previous-vote))
-                  (previous-direction (get vote-direction previous-vote))
-                  (votes-for (get votes-for proposal))
-                  (votes-against (get votes-against proposal))
-                  (new-votes-for (if vote-direction
-                    (+ votes-for vote-amount (if previous-direction u0 previous-amount))
-                    (- votes-for (if previous-direction previous-amount u0))))
-                  (new-votes-against (if vote-direction
-                    (- votes-against (if previous-direction u0 previous-amount))
-                    (+ votes-against vote-amount (if previous-direction previous-amount u0))))
-                )
-                ;; Update proposal votes
-                (map-set governance-proposals
-                  { proposal-id: proposal-id }
-                  (merge proposal
-                    {
-                      votes-for: new-votes-for,
-                      votes-against: new-votes-against
-                    }
+          (match user-balance-result
+            user-balance
+              (begin
+                ;; Check if user has enough tokens
+                (asserts! (>= user-balance vote-amount) ERR_INSUFFICIENT_BALANCE)
+                
+                ;; Record vote
+                (match (map-get? user-votes { proposal-id: proposal-id, voter: tx-sender })
+                  previous-vote
+                    ;; Update existing vote
+                    (let
+                      (
+                        (previous-amount (get vote-amount previous-vote))
+                        (previous-direction (get vote-direction previous-vote))
+                        (votes-for (get votes-for proposal))
+                        (votes-against (get votes-against proposal))
+                        (new-votes-for (if vote-direction
+                          (+ votes-for vote-amount (if previous-direction u0 previous-amount))
+                          (- votes-for (if previous-direction previous-amount u0))))
+                        (new-votes-against (if vote-direction
+                          (- votes-against (if previous-direction u0 previous-amount))
+                          (+ votes-against vote-amount (if previous-direction previous-amount u0))))
+                      )
+                      ;; Update proposal votes
+                      (map-set governance-proposals
+                        { proposal-id: proposal-id }
+                        (merge proposal
+                          {
+                            votes-for: new-votes-for,
+                            votes-against: new-votes-against
+                          }
+                        )
+                      )
+                      
+                      ;; Update user vote
+                      (map-set user-votes
+                        { proposal-id: proposal-id, voter: tx-sender }
+                        { vote-amount: vote-amount, vote-direction: vote-direction }
+                      )
+                      
+                      (ok true)
+                    )
+                  ;; New vote
+                  (let
+                    (
+                      (votes-for (get votes-for proposal))
+                      (votes-against (get votes-against proposal))
+                      (new-votes-for (if vote-direction (+ votes-for vote-amount) votes-for))
+                      (new-votes-against (if vote-direction votes-against (+ votes-against vote-amount)))
+                    )
+                    ;; Update proposal votes
+                    (map-set governance-proposals
+                      { proposal-id: proposal-id }
+                      (merge proposal
+                        {
+                          votes-for: new-votes-for,
+                          votes-against: new-votes-against
+                        }
+                      )
+                    )
+                    
+                    ;; Record user vote
+                    (map-set user-votes
+                      { proposal-id: proposal-id, voter: tx-sender }
+                      { vote-amount: vote-amount, vote-direction: vote-direction }
+                    )
+                    
+                    (ok true)
                   )
                 )
-                
-                ;; Update user vote
-                (map-set user-votes
-                  { proposal-id: proposal-id, voter: tx-sender }
-                  { vote-amount: vote-amount, vote-direction: vote-direction }
-                )
               )
-            ;; New vote
-            (let
-              (
-                (votes-for (get votes-for proposal))
-                (votes-against (get votes-against proposal))
-                (new-votes-for (if vote-direction (+ votes-for vote-amount) votes-for))
-                (new-votes-against (if vote-direction votes-against (+ votes-against vote-amount)))
-              )
-              ;; Update proposal votes
-              (map-set governance-proposals
-                { proposal-id: proposal-id }
-                (merge proposal
-                  {
-                    votes-for: new-votes-for,
-                    votes-against: new-votes-against
-                  }
-                )
-              )
-              
-              ;; Record user vote
-              (map-set user-votes
-                { proposal-id: proposal-id, voter: tx-sender }
-                { vote-amount: vote-amount, vote-direction: vote-direction }
-              )
-            )
+            err (err ERR_INSUFFICIENT_BALANCE)
           )
-          
-          (ok true)
         )
       (err ERR_PROPOSAL_NOT_ACTIVE)
     )
@@ -565,7 +611,7 @@
           (
             (votes-for (get votes-for proposal))
             (votes-against (get votes-against proposal))
-            (proposal-ended (> block-height (get end-block proposal)))
+            (proposal-ended (> stacks-block-height (get end-block proposal)))
             (proposal-active (is-eq (get status proposal) "active"))
             (parameter-name (get parameter-name proposal))
             (proposed-value (get proposed-value proposal))
@@ -623,10 +669,19 @@
   )
 )
 
-;; Initialize oracle contract (can only be called by contract owner)
-(define-public (set-oracle (oracle-contract <oracle-trait>))
+;; Set oracle contract (can only be called by contract owner)
+(define-public (set-oracle (new-oracle principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-    (contract-call? .contract-manager set-contract "price-oracle" (contract-of oracle-contract))
+    (var-set oracle-contract new-oracle)
+    (ok true)
+  )
+)
+
+(define-public (set-btc-price (new-price uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set btc-price new-price)
+    (ok true)
   )
 )
