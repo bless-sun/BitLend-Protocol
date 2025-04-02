@@ -466,3 +466,90 @@
     )
   )
 )
+
+;; Vote on proposal
+(define-public (vote-on-proposal (proposal-id uint) (vote-direction bool) (vote-amount uint))
+  (begin
+    (asserts! (var-get governance-enabled) ERR_GOVERNANCE_DISABLED)
+    
+    (match (map-get? governance-proposals { proposal-id: proposal-id })
+      proposal
+        (let
+          (
+            (user-balance (unwrap! (ft-get-balance GOVERNANCE_TOKEN tx-sender) ERR_INSUFFICIENT_BALANCE))
+            (proposal-active (is-eq (get status proposal) "active"))
+            (not-ended (<= block-height (get end-block proposal)))
+          )
+          ;; Check if proposal is active and not ended
+          (asserts! (and proposal-active not-ended) ERR_PROPOSAL_NOT_ACTIVE)
+          
+          ;; Check if user has enough tokens
+          (asserts! (>= user-balance vote-amount) ERR_INSUFFICIENT_BALANCE)
+          
+          ;; Record vote
+          (match (map-get? user-votes { proposal-id: proposal-id, voter: tx-sender })
+            previous-vote
+              ;; Update existing vote
+              (let
+                (
+                  (previous-amount (get vote-amount previous-vote))
+                  (previous-direction (get vote-direction previous-vote))
+                  (votes-for (get votes-for proposal))
+                  (votes-against (get votes-against proposal))
+                  (new-votes-for (if vote-direction
+                    (+ votes-for vote-amount (if previous-direction u0 previous-amount))
+                    (- votes-for (if previous-direction previous-amount u0))))
+                  (new-votes-against (if vote-direction
+                    (- votes-against (if previous-direction u0 previous-amount))
+                    (+ votes-against vote-amount (if previous-direction previous-amount u0))))
+                )
+                ;; Update proposal votes
+                (map-set governance-proposals
+                  { proposal-id: proposal-id }
+                  (merge proposal
+                    {
+                      votes-for: new-votes-for,
+                      votes-against: new-votes-against
+                    }
+                  )
+                )
+                
+                ;; Update user vote
+                (map-set user-votes
+                  { proposal-id: proposal-id, voter: tx-sender }
+                  { vote-amount: vote-amount, vote-direction: vote-direction }
+                )
+              )
+            ;; New vote
+            (let
+              (
+                (votes-for (get votes-for proposal))
+                (votes-against (get votes-against proposal))
+                (new-votes-for (if vote-direction (+ votes-for vote-amount) votes-for))
+                (new-votes-against (if vote-direction votes-against (+ votes-against vote-amount)))
+              )
+              ;; Update proposal votes
+              (map-set governance-proposals
+                { proposal-id: proposal-id }
+                (merge proposal
+                  {
+                    votes-for: new-votes-for,
+                    votes-against: new-votes-against
+                  }
+                )
+              )
+              
+              ;; Record user vote
+              (map-set user-votes
+                { proposal-id: proposal-id, voter: tx-sender }
+                { vote-amount: vote-amount, vote-direction: vote-direction }
+              )
+            )
+          )
+          
+          (ok true)
+        )
+      (err ERR_PROPOSAL_NOT_ACTIVE)
+    )
+  )
+)
