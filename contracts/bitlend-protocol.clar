@@ -553,3 +553,80 @@
     )
   )
 )
+
+;; Execute passed proposal
+(define-public (execute-proposal (proposal-id uint))
+  (begin
+    (asserts! (var-get governance-enabled) ERR_GOVERNANCE_DISABLED)
+    
+    (match (map-get? governance-proposals { proposal-id: proposal-id })
+      proposal
+        (let
+          (
+            (votes-for (get votes-for proposal))
+            (votes-against (get votes-against proposal))
+            (proposal-ended (> block-height (get end-block proposal)))
+            (proposal-active (is-eq (get status proposal) "active"))
+            (parameter-name (get parameter-name proposal))
+            (proposed-value (get proposed-value proposal))
+          )
+          ;; Check if proposal has ended and is still active
+          (asserts! (and proposal-ended proposal-active) ERR_PROPOSAL_NOT_ACTIVE)
+          
+          ;; Check if proposal passed (more votes for than against)
+          (if (> votes-for votes-against)
+            (begin
+              ;; Update parameter
+              (map-set protocol-parameters
+                { parameter-name: parameter-name }
+                { value: proposed-value }
+              )
+              
+              ;; Update proposal status
+              (map-set governance-proposals
+                { proposal-id: proposal-id }
+                (merge proposal { status: "executed" })
+              )
+              
+              (ok true)
+            )
+            (begin
+              ;; Update proposal status to rejected
+              (map-set governance-proposals
+                { proposal-id: proposal-id }
+                (merge proposal { status: "rejected" })
+              )
+              
+              (ok false)
+            )
+          )
+        )
+      (err ERR_PROPOSAL_NOT_ACTIVE)
+    )
+  )
+)
+
+;; Emergency functions (only callable by contract owner)
+(define-public (toggle-protocol-pause)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set protocol-paused (not (var-get protocol-paused)))
+    (ok (var-get protocol-paused))
+  )
+)
+
+;; Mint governance tokens (for testing or initial distribution)
+(define-public (mint-governance-tokens (recipient principal) (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (ft-mint? GOVERNANCE_TOKEN amount recipient)
+  )
+)
+
+;; Initialize oracle contract (can only be called by contract owner)
+(define-public (set-oracle (oracle-contract <oracle-trait>))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (contract-call? .contract-manager set-contract "price-oracle" (contract-of oracle-contract))
+  )
+)
